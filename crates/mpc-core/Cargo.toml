@@ -1,0 +1,23 @@
+[package]
+name = "mpc-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Platform-independent core of MultiPC: protocol, encryption, screen layout, file helpers"
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+postcard.workspace = true
+snow.workspace = true
+sha2.workspace = true
+hex.workspace = true
+getrandom.workspace = true
+toml.workspace = true
+dirs.workspace = true
+gethostname.workspace = true
+miniz_oxide.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full", "test-util"] }
