@@ -30,7 +30,7 @@ pub fn decode_frame(jpeg: &[u8]) -> Result<Frame> {
     let info = dec.info().ok_or_else(|| anyhow::anyhow!("no image info"))?;
     ensure!(info.pixel_format == jpeg_decoder::PixelFormat::RGB24, "unexpected JPEG format");
     let mut bgra = Vec::with_capacity(rgb.len() / 3 * 4);
-    for p in rgb.chunks_exact(3) {
+    for p in rgb.as_chunks::<3>().0 {
         bgra.extend_from_slice(&[p[2], p[1], p[0], 255]);
     }
     Ok(Frame { width: info.width as u32, height: info.height as u32, bgra })
