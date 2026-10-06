@@ -62,11 +62,13 @@ fn main() -> Result<()> {
             } else {
                 let cfg = Config { key: generate_key(), ..Default::default() };
                 cfg.save_to(&path)?;
-                println!("Создана новая группа. Ключ сопряжения:\n\n    {}\n", pretty_key(&cfg.key));
-                println!("На остальных компьютерах выполните:  multipc init --key {}\n", pretty_key(&cfg.key));
                 cfg
             };
             tracing::info!("MultiPC {} on {:?}, settings in {}", env!("CARGO_PKG_VERSION"), cfg.name, path.display());
+            println!(
+                "MultiPC запущен. Панель управления: http://127.0.0.1:{}\nЧтобы подключить другой ПК, запустите MultiPC и на нём, затем нажмите «Отправить запрос» в разделе «Устройства в сети».\nНе закрывайте это окно.\n",
+                cfg.control_port
+            );
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(daemon::run(cfg))
         }

@@ -39,6 +39,9 @@ pub async fn start(port: u16, cfg_dir: PathBuf, events: mpsc::UnboundedSender<Ev
         .route("/api/state", get(api_state))
         .route("/api/layout", post(api_layout))
         .route("/api/send", post(api_send))
+        .route("/api/pair", post(api_pair))
+        .route("/api/pair/answer", post(api_pair_answer))
+        .route("/api/firewall", post(api_firewall))
         .with_state(state);
     let listener =
         tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await.with_context(|| format!("control panel port {port} is busy"))?;
@@ -121,6 +124,77 @@ async fn api_send(State(state): State<AppState>, headers: HeaderMap, Json(body):
         Ok(Ok(())) => StatusCode::ACCEPTED.into_response(),
         Ok(Err(e)) => (StatusCode::BAD_REQUEST, e).into_response(),
         Err(r) => r.into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct PairBody {
+    /// A name from the device list, or an address.
+    target: String,
+}
+
+async fn api_pair(State(state): State<AppState>, headers: HeaderMap, Json(body): Json<PairBody>) -> Response {
+    if let Err(r) = check(&state, &headers) {
+        return r.into_response();
+    }
+    match ask(&state, |reply| ApiRequest::Pair { target: body.target.trim().to_string(), reply }).await {
+        Ok(Ok(())) => StatusCode::ACCEPTED.into_response(),
+        Ok(Err(e)) => (StatusCode::BAD_REQUEST, e).into_response(),
+        Err(r) => r.into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct AnswerBody {
+    id: u64,
+    accept: bool,
+}
+
+async fn api_pair_answer(State(state): State<AppState>, headers: HeaderMap, Json(body): Json<AnswerBody>) -> Response {
+    if let Err(r) = check(&state, &headers) {
+        return r.into_response();
+    }
+    match ask(&state, |reply| ApiRequest::PairAnswer { id: body.id, accept: body.accept, reply }).await {
+        Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
+        Ok(Err(e)) => (StatusCode::GONE, e).into_response(),
+        Err(r) => r.into_response(),
+    }
+}
+
+/// Add a Windows Firewall rule letting other PCs reach MultiPC on any network
+/// type. Windows shows its administrator prompt for this.
+async fn api_firewall(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(r) = check(&state, &headers) {
+        return r.into_response();
+    }
+    match allow_through_firewall() {
+        Ok(()) => StatusCode::ACCEPTED.into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response(),
+    }
+}
+
+#[cfg(windows)]
+fn allow_through_firewall() -> Result<()> {
+    let exe = std::env::current_exe()?.display().to_string().replace('\'', "''");
+    let args = format!("advfirewall firewall add rule name=\"MultiPC\" dir=in action=allow program=\"{exe}\" enable=yes profile=any");
+    let script = format!("Start-Process netsh -Verb RunAs -WindowStyle Hidden -ArgumentList '{args}'");
+    std::process::Command::new("powershell").args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &script]).spawn()?;
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn allow_through_firewall() -> Result<()> {
+    anyhow::bail!("only needed on Windows")
+}
+
+/// Open the control panel in the default browser.
+pub fn open_in_browser(url: &str) {
+    #[cfg(windows)]
+    let r = std::process::Command::new("cmd").args(["/C", "start", "", url]).spawn();
+    #[cfg(not(windows))]
+    let r = std::process::Command::new("xdg-open").arg(url).spawn();
+    if let Err(e) = r {
+        tracing::debug!("could not open the browser: {e}");
     }
 }
 

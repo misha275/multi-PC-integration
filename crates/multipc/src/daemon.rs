@@ -15,7 +15,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, oneshot};
 
 pub struct PeerHandle {
@@ -35,10 +35,46 @@ pub struct PeerHandle {
 
 pub enum Event {
     Connected(PeerHandle),
-    Disconnected { name: String, conn_id: u64 },
-    FromPeer { name: String, conn_id: u64, msg: Message },
-    Beacon { name: String, addr: SocketAddr },
-    DialDone { key: String },
+    Disconnected {
+        name: String,
+        conn_id: u64,
+    },
+    FromPeer {
+        name: String,
+        conn_id: u64,
+        msg: Message,
+    },
+    Beacon {
+        name: String,
+        addr: SocketAddr,
+        platform: Platform,
+        same_group: bool,
+    },
+    /// Another machine asks to join our group; `answer` carries the user's choice.
+    PairIncoming {
+        id: u64,
+        name: String,
+        platform: Platform,
+        addr: SocketAddr,
+        code: String,
+        answer: oneshot::Sender<bool>,
+    },
+    PairIncomingDone {
+        id: u64,
+    },
+    PairOutgoing {
+        id: u64,
+        progress: net::PairProgress,
+    },
+    /// Our join request was accepted: switch to that group's key.
+    PairJoined {
+        name: String,
+        key: String,
+        addr: SocketAddr,
+    },
+    DialDone {
+        key: String,
+    },
     Local(LocalEvent),
     Clipboard(ClipboardData),
     Tick,
@@ -48,7 +84,63 @@ pub enum Event {
 pub enum ApiRequest {
     State(oneshot::Sender<StateView>),
     SetPlacements(BTreeMap<String, Placement>, oneshot::Sender<()>),
-    SendFiles { peer: String, paths: Vec<PathBuf>, reply: oneshot::Sender<Result<(), String>> },
+    SendFiles {
+        peer: String,
+        paths: Vec<PathBuf>,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    /// Ask the machine at this address ("192.168.1.5" or a name seen on the LAN) to join.
+    Pair {
+        target: String,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    PairAnswer {
+        id: u64,
+        accept: bool,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+}
+
+/// A MultiPC heard on the LAN.
+struct Discovered {
+    addr: SocketAddr,
+    platform: Platform,
+    same_group: bool,
+    seen: Instant,
+}
+
+struct IncomingPair {
+    id: u64,
+    name: String,
+    platform: Platform,
+    addr: SocketAddr,
+    code: String,
+    answer: Option<oneshot::Sender<bool>>,
+}
+
+#[derive(Serialize)]
+pub struct DeviceView {
+    pub name: String,
+    pub address: String,
+    pub platform: Platform,
+    /// "connected", "group" (our group, connecting) or "other" (can be asked to join).
+    pub status: &'static str,
+}
+
+#[derive(Serialize)]
+pub struct PairRequestView {
+    pub id: u64,
+    pub name: String,
+    pub address: String,
+    pub platform: Platform,
+    pub code: String,
+}
+
+#[derive(Serialize)]
+pub struct PairOutgoingView {
+    pub id: u64,
+    pub target: String,
+    pub progress: net::PairProgress,
 }
 
 #[derive(Serialize)]
@@ -70,6 +162,10 @@ pub struct StateView {
     pub machines: Vec<MachineView>,
     pub transfers: Vec<TransferStatus>,
     pub download_dir: String,
+    pub devices: Vec<DeviceView>,
+    pub pair_requests: Vec<PairRequestView>,
+    pub pair_outgoing: Vec<PairOutgoingView>,
+    pub windows: bool,
 }
 
 fn now_ms() -> u64 {
@@ -105,6 +201,10 @@ struct Engine {
     forwarded_to: Option<String>,
     pressed_keys: HashSet<(u16, bool, u16)>,
     pressed_buttons: HashSet<MouseButton>,
+
+    discovered: BTreeMap<String, Discovered>,
+    pair_incoming: Vec<IncomingPair>,
+    pair_outgoing: Vec<PairOutgoingView>,
 }
 
 pub async fn run(cfg: Config) -> Result<()> {
@@ -161,6 +261,9 @@ pub async fn run(cfg: Config) -> Result<()> {
         });
     }
     web::start(cfg.control_port, cfg_dir.clone(), events_tx.clone()).await?;
+    if cfg.open_panel {
+        web::open_in_browser(&format!("http://127.0.0.1:{}", cfg.control_port));
+    }
     let clipboard = if cfg.share_clipboard { clipboard::start(events_tx.clone()) } else { None };
     {
         let events = events_tx.clone();
@@ -197,6 +300,9 @@ pub async fn run(cfg: Config) -> Result<()> {
         forwarded_to: None,
         pressed_keys: HashSet::new(),
         pressed_buttons: HashSet::new(),
+        discovered: BTreeMap::new(),
+        pair_incoming: Vec::new(),
+        pair_outgoing: Vec::new(),
     };
     engine.rebuild_geometry();
     engine.ensure_placements();
@@ -222,12 +328,28 @@ impl Engine {
                     self.on_peer_message(&name, msg);
                 }
             }
-            Event::Beacon { name, addr } => {
+            Event::Beacon { name, addr, platform, same_group } => {
+                self.discovered.insert(name.clone(), Discovered { addr, platform, same_group, seen: Instant::now() });
                 // The machine with the smaller name dials, so each pair connects once.
-                if self.name < name && !self.peers.contains_key(&name) {
+                if same_group && self.name < name && !self.peers.contains_key(&name) {
                     self.dial(name, addr);
                 }
             }
+            Event::PairIncoming { id, name, platform, addr, code, answer } => {
+                tracing::info!("{name} ({addr}) asks to join; code {code}");
+                self.pair_incoming.retain(|p| p.name != name);
+                self.pair_incoming.push(IncomingPair { id, name, platform, addr, code, answer: Some(answer) });
+                if self.pair_incoming.len() > 5 {
+                    self.pair_incoming.remove(0);
+                }
+            }
+            Event::PairIncomingDone { id } => self.pair_incoming.retain(|p| p.id != id),
+            Event::PairOutgoing { id, progress } => {
+                if let Some(p) = self.pair_outgoing.iter_mut().find(|p| p.id == id) {
+                    p.progress = progress;
+                }
+            }
+            Event::PairJoined { name, key, addr } => self.join_group(&name, &key, addr),
             Event::DialDone { key } => {
                 self.dialing.remove(&key);
             }
@@ -257,6 +379,7 @@ impl Engine {
     }
 
     fn on_tick(&mut self) {
+        self.discovered.retain(|_, d| d.seen.elapsed() < Duration::from_secs(12));
         if self.caps.input {
             let monitors = self.backend.monitors();
             if monitors != self.monitors && !monitors.is_empty() {
@@ -569,8 +692,67 @@ impl Engine {
         h.focus = self.focus.clone();
     }
 
+    /// Our join request was accepted: take the other group's key, drop the old
+    /// group's connections and reconnect with the new key.
+    fn join_group(&mut self, via: &str, key: &str, addr: SocketAddr) {
+        let psk = match config::parse_key(key) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!("{via} sent an invalid key: {e:#}");
+                return;
+            }
+        };
+        tracing::info!("joined the group of {via}");
+        self.cfg.key = hex::encode(psk);
+        if let Err(e) = self.cfg.save_to(&self.cfg_dir.join("config.toml")) {
+            tracing::warn!("saving settings: {e:#}");
+        }
+        self.net.set_psk(psk);
+        for p in self.peers.values_mut() {
+            if let Some(a) = p.abort.take() {
+                let _ = a.send(());
+            }
+        }
+        // Beacons heard so far carry the old group's verdicts; let new ones decide.
+        self.discovered.clear();
+        // Connect right away instead of waiting for the next beacon.
+        self.dial(format!("joined:{via}"), addr);
+    }
+
+    fn start_pair(&mut self, target: String, reply: oneshot::Sender<Result<(), String>>) {
+        let known = self.discovered.get(&target).map(|d| d.addr);
+        let id = transfer::js_safe_id();
+        self.pair_outgoing.retain(|p| p.target != target);
+        self.pair_outgoing.push(PairOutgoingView { id, target: target.clone(), progress: net::PairProgress::Connecting });
+        let (net, port, events) = (self.net.clone(), self.cfg.port, self.events.clone());
+        tokio::spawn(async move {
+            let addr = match known {
+                Some(a) => Some(a),
+                None => net::resolve(&target, port).await,
+            };
+            match addr {
+                Some(addr) => net::pair_outgoing(net, id, addr).await,
+                None => {
+                    let error = format!("address {target} not found");
+                    let _ = events.send(Event::PairOutgoing { id, progress: net::PairProgress::Failed { error } });
+                }
+            }
+        });
+        let _ = reply.send(Ok(()));
+    }
+
     fn on_api(&mut self, req: ApiRequest) {
         match req {
+            ApiRequest::Pair { target, reply } => self.start_pair(target, reply),
+            ApiRequest::PairAnswer { id, accept, reply } => {
+                let answer = self.pair_incoming.iter_mut().find(|p| p.id == id).and_then(|p| p.answer.take());
+                let result = match answer {
+                    Some(tx) => tx.send(accept).map_err(|_| "the request is no longer active".to_string()),
+                    None => Err("the request is no longer active".to_string()),
+                };
+                self.pair_incoming.retain(|p| p.id != id);
+                let _ = reply.send(result);
+            }
             ApiRequest::State(reply) => {
                 let _ = reply.send(self.state_view());
             }
@@ -626,7 +808,45 @@ impl Engine {
             machines,
             transfers: self.transfers.snapshot(),
             download_dir: self.cfg.download_dir().display().to_string(),
+            devices: self.devices_view(),
+            pair_requests: self
+                .pair_incoming
+                .iter()
+                .map(|p| PairRequestView {
+                    id: p.id,
+                    name: p.name.clone(),
+                    address: p.addr.ip().to_string(),
+                    platform: p.platform,
+                    code: p.code.clone(),
+                })
+                .collect(),
+            pair_outgoing: self
+                .pair_outgoing
+                .iter()
+                .map(|p| PairOutgoingView { id: p.id, target: p.target.clone(), progress: p.progress.clone() })
+                .collect(),
+            windows: cfg!(windows),
         }
+    }
+
+    fn devices_view(&self) -> Vec<DeviceView> {
+        let mut v: Vec<DeviceView> = self
+            .peers
+            .values()
+            .map(|p| DeviceView { name: p.name.clone(), address: p.addr.ip().to_string(), platform: p.hello.platform, status: "connected" })
+            .collect();
+        for (name, d) in &self.discovered {
+            if !self.peers.contains_key(name) {
+                v.push(DeviceView {
+                    name: name.clone(),
+                    address: d.addr.ip().to_string(),
+                    platform: d.platform,
+                    status: if d.same_group { "group" } else { "other" },
+                });
+            }
+        }
+        v.sort_by(|a, b| a.name.cmp(&b.name));
+        v
     }
 }
 
@@ -713,6 +933,9 @@ mod tests {
             forwarded_to: None,
             pressed_keys: HashSet::new(),
             pressed_buttons: HashSet::new(),
+            discovered: BTreeMap::new(),
+            pair_incoming: Vec::new(),
+            pair_outgoing: Vec::new(),
         };
         e.rebuild_geometry();
         e
@@ -836,6 +1059,49 @@ mod tests {
         e.handle(Event::Local(LocalEvent::MouseAt(Point::new(1910, 10))));
         e.handle(Event::Local(LocalEvent::MouseAt(Point::new(1919, 10))));
         assert_eq!(e.focus, FocusToken { epoch: 8, owner: "beta".into() });
+    }
+
+    #[test]
+    fn join_requests_are_listed_and_answered() {
+        let mut e = engine(FakeBackend::default());
+        let (answer, mut answered) = oneshot::channel();
+        e.handle(Event::PairIncoming {
+            id: 9,
+            name: "КУХНЯ".into(),
+            platform: Platform::Windows,
+            addr: "192.168.1.31:47800".parse().unwrap(),
+            code: "123 456".into(),
+            answer,
+        });
+        let view = e.state_view();
+        assert_eq!(view.pair_requests.len(), 1);
+        assert_eq!(view.pair_requests[0].code, "123 456");
+
+        let (reply, mut result) = oneshot::channel();
+        e.handle(Event::Api(ApiRequest::PairAnswer { id: 9, accept: true, reply }));
+        assert_eq!(result.try_recv().unwrap(), Ok(()));
+        assert!(answered.try_recv().unwrap());
+        assert!(e.state_view().pair_requests.is_empty());
+
+        // Answering twice is refused.
+        let (reply, mut result) = oneshot::channel();
+        e.handle(Event::Api(ApiRequest::PairAnswer { id: 9, accept: true, reply }));
+        assert!(result.try_recv().unwrap().is_err());
+    }
+
+    #[test]
+    fn devices_from_other_groups_are_listed_but_not_dialed() {
+        let mut e = engine(FakeBackend::default());
+        e.handle(Event::Beacon {
+            name: "zeta".into(),
+            addr: "192.168.1.9:47800".parse().unwrap(),
+            platform: Platform::Windows,
+            same_group: false,
+        });
+        assert!(e.dialing.is_empty());
+        let view = e.devices_view();
+        assert_eq!(view.len(), 1);
+        assert_eq!((view[0].name.as_str(), view[0].status), ("zeta", "other"));
     }
 
     #[test]

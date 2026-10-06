@@ -8,7 +8,7 @@ use crate::geometry::{Placement, Point, Rect};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 /// TCP port for peer connections and UDP port for discovery beacons.
 pub const DEFAULT_PORT: u16 = 47800;
 /// Local HTTP port of the control panel (bound to 127.0.0.1 only).
@@ -189,6 +189,48 @@ impl Message {
     }
 }
 
+/// Messages on a pairing connection, before the asking machine knows the key.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PairMessage {
+    /// "Let me join your group."
+    Request {
+        name: String,
+        platform: Platform,
+    },
+    /// The user on the other machine said yes: here is the group key.
+    Accept {
+        name: String,
+        key: String,
+    },
+    Decline,
+}
+
+/// Announcement every MultiPC sends on the LAN, so all machines are listed in the
+/// panel, including ones from another group that can be asked to join.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Beacon {
+    pub name: String,
+    pub port: u16,
+    pub platform: Platform,
+    /// Public tag of the sender's group (see `config::group_id`).
+    pub group: [u8; 8],
+}
+
+const BEACON_MAGIC: &[u8; 4] = b"MPB2";
+
+impl Beacon {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut v = BEACON_MAGIC.to_vec();
+        v.extend(postcard::to_stdvec(self).expect("beacon serializes"));
+        v
+    }
+
+    pub fn decode(data: &[u8]) -> Option<Beacon> {
+        let body = data.strip_prefix(BEACON_MAGIC)?;
+        postcard::from_bytes(body).ok()
+    }
+}
+
 pub fn encode_image(width: u32, height: u32, rgba: &[u8]) -> ClipboardData {
     ClipboardData::Image { width, height, rgba_deflate: miniz_oxide::deflate::compress_to_vec(rgba, 3) }
 }
@@ -218,6 +260,14 @@ mod tests {
         assert_eq!(postcard::from_bytes::<Message>(&bytes).unwrap(), m);
         // Input events must stay tiny: they are sent for every mouse movement.
         assert!(bytes.len() < 12, "{} bytes", bytes.len());
+    }
+
+    #[test]
+    fn beacon_roundtrip() {
+        let b = Beacon { name: "ПК-1".into(), port: 47800, platform: Platform::Windows, group: [3; 8] };
+        assert_eq!(Beacon::decode(&b.encode()), Some(b));
+        assert_eq!(Beacon::decode(b"MPB2"), None);
+        assert_eq!(Beacon::decode(b"garbage"), None);
     }
 
     #[test]

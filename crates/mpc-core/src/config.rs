@@ -26,6 +26,8 @@ pub struct Config {
     pub download_dir: Option<PathBuf>,
     pub share_input: bool,
     pub share_clipboard: bool,
+    /// Open the control panel in the browser when MultiPC starts.
+    pub open_panel: bool,
 }
 
 impl Default for Config {
@@ -39,6 +41,7 @@ impl Default for Config {
             download_dir: None,
             share_input: true,
             share_clipboard: true,
+            open_panel: true,
         }
     }
 }

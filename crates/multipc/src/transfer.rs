@@ -53,6 +53,11 @@ impl Transfers {
     }
 }
 
+/// Random id that survives a round trip through JavaScript numbers (53 bits).
+pub fn js_safe_id() -> u64 {
+    random_id() & ((1 << 53) - 1)
+}
+
 pub fn random_id() -> u64 {
     let mut b = [0u8; 8];
     getrandom::fill(&mut b).expect("system random generator");
