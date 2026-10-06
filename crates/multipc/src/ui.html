@@ -60,6 +60,18 @@
     </div>
   </div>
 
+  <div class="card" id="windowsCard" style="display:none">
+    <h2>Перенос окон</h2>
+    <div id="sharesBox"></div>
+    <div class="row">
+      <select id="winSel" style="flex:1 1 260px"></select>
+      <select id="winPeer"></select>
+      <button id="winBtn">Перенести</button>
+    </div>
+    <div class="hint">Или просто перетащите окно за край экрана к соседнему ПК. Программа продолжает работать на этом ПК, а на другом появляется её окно: им можно пользоваться мышью и клавиатурой. Чтобы вернуть окно, закройте его на другом ПК или нажмите «Вернуть».</div>
+    <div id="winState" class="hint"></div>
+  </div>
+
   <div class="card">
     <h2>Расположение экранов</h2>
     <div id="canvas"></div>
@@ -177,6 +189,7 @@ function renderTables() {
   document.getElementById("sub").textContent = `Этот компьютер: ${state.name}. Курсор сейчас на: ${state.cursor_on}.`;
   document.getElementById("dl").textContent = state.download_dir;
   renderDevices();
+  renderWindows();
   const sel = document.getElementById("peer"), cur = sel.value;
   const peers = state.machines.filter(m => !m.is_self && m.caps.files);
   sel.innerHTML = peers.map(m => `<option>${esc(m.name)}</option>`).join("") || "<option value=''>нет получателей</option>";
@@ -224,6 +237,29 @@ function renderDevices() {
   document.getElementById("fwRow").style.display = state.windows ? "flex" : "none";
 }
 
+function renderWindows() {
+  const peers = state.machines.filter(m => !m.is_self && m.caps.windows);
+  const card = document.getElementById("windowsCard");
+  card.style.display = state.window_list.length || state.shares.length ? "block" : "none";
+  document.getElementById("sharesBox").innerHTML = state.shares.map(s =>
+    `<div class="row" style="margin-bottom:8px"><span>«${esc(s.title)}» показано на ${esc(s.peer)}</span><button class="secondary" data-unshare="${s.share}">Вернуть</button></div>`).join("");
+  document.querySelectorAll("[data-unshare]").forEach(b => b.onclick = async () => {
+    await api("/api/window/stop", { method: "POST", body: JSON.stringify({ share: Number(b.dataset.unshare) }) });
+    refresh();
+  });
+  const sel = document.getElementById("winSel"), cur = sel.value;
+  if (document.activeElement !== sel) {
+    sel.innerHTML = state.window_list.map(w => `<option value="${w.id}">${esc(w.title)} (${w.width}×${w.height})</option>`).join("") || "<option value=''>нет окон</option>";
+    if (state.window_list.some(w => String(w.id) === cur)) sel.value = cur;
+  }
+  const ps = document.getElementById("winPeer"), curP = ps.value;
+  if (document.activeElement !== ps) {
+    ps.innerHTML = peers.map(m => `<option>${esc(m.name)}</option>`).join("") || "<option value=''>нет подключённых ПК</option>";
+    if (peers.some(m => m.name === curP)) ps.value = curP;
+  }
+  document.getElementById("winBtn").disabled = !peers.length || !state.window_list.length;
+}
+
 async function pair(target) {
   const r = await api("/api/pair", { method: "POST", body: JSON.stringify({ target }) });
   if (!r.ok) alert("Не удалось отправить запрос: " + await r.text());
@@ -265,6 +301,13 @@ document.getElementById("send").onclick = async () => {
   if (!peer || !paths.length) { out.textContent = "Выберите компьютер и укажите путь."; return; }
   const r = await api("/api/send", { method: "POST", body: JSON.stringify({ peer, paths }) });
   out.textContent = r.ok ? "Отправка началась." : "Ошибка: " + await r.text();
+  refresh();
+};
+document.getElementById("winBtn").onclick = async () => {
+  const window = Number(document.getElementById("winSel").value), peer = document.getElementById("winPeer").value;
+  if (!window || !peer) return;
+  const r = await api("/api/window/share", { method: "POST", body: JSON.stringify({ window, peer }) });
+  document.getElementById("winState").textContent = r.ok ? `Окно показано на ${peer}.` : "Не получилось: " + await r.text();
   refresh();
 };
 document.getElementById("pairBtn").onclick = () => {

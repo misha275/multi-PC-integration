@@ -42,6 +42,8 @@ pub async fn start(port: u16, cfg_dir: PathBuf, events: mpsc::UnboundedSender<Ev
         .route("/api/pair", post(api_pair))
         .route("/api/pair/answer", post(api_pair_answer))
         .route("/api/firewall", post(api_firewall))
+        .route("/api/window/share", post(api_window_share))
+        .route("/api/window/stop", post(api_window_stop))
         .with_state(state);
     let listener =
         tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await.with_context(|| format!("control panel port {port} is busy"))?;
@@ -155,6 +157,39 @@ async fn api_pair_answer(State(state): State<AppState>, headers: HeaderMap, Json
         return r.into_response();
     }
     match ask(&state, |reply| ApiRequest::PairAnswer { id: body.id, accept: body.accept, reply }).await {
+        Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
+        Ok(Err(e)) => (StatusCode::GONE, e).into_response(),
+        Err(r) => r.into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct ShareBody {
+    window: u64,
+    peer: String,
+}
+
+async fn api_window_share(State(state): State<AppState>, headers: HeaderMap, Json(body): Json<ShareBody>) -> Response {
+    if let Err(r) = check(&state, &headers) {
+        return r.into_response();
+    }
+    match ask(&state, |reply| ApiRequest::ShareWindow { window: body.window, peer: body.peer, reply }).await {
+        Ok(Ok(())) => StatusCode::ACCEPTED.into_response(),
+        Ok(Err(e)) => (StatusCode::BAD_REQUEST, e).into_response(),
+        Err(r) => r.into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct StopBody {
+    share: u64,
+}
+
+async fn api_window_stop(State(state): State<AppState>, headers: HeaderMap, Json(body): Json<StopBody>) -> Response {
+    if let Err(r) = check(&state, &headers) {
+        return r.into_response();
+    }
+    match ask(&state, |reply| ApiRequest::StopShare { share: body.share, reply }).await {
         Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
         Ok(Err(e)) => (StatusCode::GONE, e).into_response(),
         Err(r) => r.into_response(),

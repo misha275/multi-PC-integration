@@ -8,7 +8,7 @@ use crate::geometry::{Placement, Point, Rect};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 /// TCP port for peer connections and UDP port for discovery beacons.
 pub const DEFAULT_PORT: u16 = 47800;
 /// Local HTTP port of the control panel (bound to 127.0.0.1 only).
@@ -47,6 +47,8 @@ pub struct Capabilities {
     pub files: bool,
     /// Exposes its drives to peers (stage 2).
     pub drives: bool,
+    /// Can show other PCs' windows and share its own.
+    pub windows: bool,
 }
 
 /// Who currently has the shared cursor. Newer tokens win; ties are broken by name
@@ -171,8 +173,40 @@ pub enum Message {
         id: u64,
         reason: String,
     },
+    /// A window of the sender is now shown on the receiver.
+    WindowOpen {
+        share: u64,
+        title: String,
+        width: u32,
+        height: u32,
+    },
+    /// New picture of a shared window, JPEG-encoded.
+    WindowFrame {
+        share: u64,
+        width: u32,
+        height: u32,
+        jpeg: Vec<u8>,
+    },
+    /// Stop showing a shared window (sent by either side).
+    WindowClose {
+        share: u64,
+    },
+    /// Keyboard or mouse used on the shown copy of a window, for the original.
+    WindowInput {
+        share: u64,
+        ev: WindowInputEvent,
+    },
     Ping(u64),
     Pong(u64),
+}
+
+/// Input for a shared window. Positions are pixels inside the original window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WindowInputEvent {
+    MouseMove { x: i32, y: i32 },
+    MouseButton { button: MouseButton, down: bool, x: i32, y: i32 },
+    Wheel { dx: i32, dy: i32, x: i32, y: i32 },
+    Key { scan: u16, extended: bool, vk: u16, down: bool },
 }
 
 impl Message {
@@ -185,6 +219,7 @@ impl Message {
                 | Message::FileChunk { .. }
                 | Message::FileEnd { .. }
                 | Message::FileAbort { .. }
+                | Message::WindowFrame { .. }
         )
     }
 }

@@ -18,7 +18,7 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 /// Marks events we inject ourselves so our own hooks let them through untouched.
-const OUR_EXTRA_INFO: usize = 0x4D50_4331; // "MPC1"
+pub(super) const OUR_EXTRA_INFO: usize = 0x4D50_4331; // "MPC1"
 
 static EVENTS: OnceLock<UnboundedSender<LocalEvent>> = OnceLock::new();
 static CAPTURE: AtomicBool = AtomicBool::new(false);
@@ -52,8 +52,12 @@ unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) 
                         emit(LocalEvent::MouseAt(pt));
                         None
                     } else {
-                        let park = unpack(PARK.load(Ordering::Relaxed));
-                        let (dx, dy) = (pt.x - park.x, pt.y - park.y);
+                        // Measure from where the cursor is now, not from the park point:
+                        // a window shown on another PC may have moved it here.
+                        let mut cur = POINT { x: 0, y: 0 };
+                        let from =
+                            if GetCursorPos(&mut cur) != 0 { Point::new(cur.x, cur.y) } else { unpack(PARK.load(Ordering::Relaxed)) };
+                        let (dx, dy) = (pt.x - from.x, pt.y - from.y);
                         Some((dx != 0 || dy != 0).then_some(InputEvent::MouseMove { dx, dy }))
                     }
                 }

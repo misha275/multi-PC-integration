@@ -1,7 +1,7 @@
 //! The engine: one task that owns all shared state (peers, layout, who has the
 //! cursor) and reacts to events from the network, local input, clipboard and UI.
 
-use crate::platform::{self, InputBackend, LocalEvent};
+use crate::platform::{self, InputBackend, LocalEvent, ViewerEvent, WindowBackend, WindowInfo};
 use crate::transfer::{self, TransferStatus, Transfers};
 use crate::{clipboard, net, web};
 use anyhow::Result;
@@ -79,10 +79,25 @@ pub enum Event {
     Clipboard(ClipboardData),
     Tick,
     Api(ApiRequest),
+    /// Something happened in a window showing another PC's window.
+    Viewer(ViewerEvent),
+    /// Our shared window was closed or can't be captured any more.
+    ShareEnded {
+        share: u64,
+    },
 }
 
 pub enum ApiRequest {
     State(oneshot::Sender<StateView>),
+    ShareWindow {
+        window: u64,
+        peer: String,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    StopShare {
+        share: u64,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
     SetPlacements(BTreeMap<String, Placement>, oneshot::Sender<()>),
     SendFiles {
         peer: String,
@@ -166,7 +181,12 @@ pub struct StateView {
     pub pair_requests: Vec<PairRequestView>,
     pub pair_outgoing: Vec<PairOutgoingView>,
     pub windows: bool,
+    /// Our windows that can be shown on another PC.
+    pub window_list: Vec<WindowInfo>,
+    pub shares: Vec<share::ShareView>,
 }
+
+mod share;
 
 fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
@@ -187,6 +207,9 @@ struct Engine {
     hello: Arc<Mutex<Hello>>,
     transfers: Transfers,
     clipboard: Option<std::sync::mpsc::Sender<ClipboardData>>,
+    windows: Arc<dyn WindowBackend>,
+    shares: HashMap<u64, share::ShareOut>,
+    viewers: HashSet<(String, u64)>,
 
     peers: HashMap<String, PeerHandle>,
     dialing: HashSet<String>,
@@ -226,7 +249,25 @@ pub async fn run(cfg: Config) -> Result<()> {
         });
     }
 
-    let caps = Capabilities { input: backend.supported() && cfg.share_input, clipboard: cfg.share_clipboard, files: true, drives: false };
+    let (viewer_tx, mut viewer_rx) = mpsc::unbounded_channel::<ViewerEvent>();
+    let windows = platform::start_windows(viewer_tx);
+    {
+        let events = events_tx.clone();
+        tokio::spawn(async move {
+            while let Some(ev) = viewer_rx.recv().await {
+                if events.send(Event::Viewer(ev)).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    let caps = Capabilities {
+        input: backend.supported() && cfg.share_input,
+        clipboard: cfg.share_clipboard,
+        files: true,
+        drives: false,
+        windows: windows.supported(),
+    };
     let monitors = if caps.input { backend.monitors() } else { Vec::new() };
     let layout = config::load_layout(&cfg_dir);
     let focus = FocusToken { epoch: 0, owner: name.clone() };
@@ -289,6 +330,9 @@ pub async fn run(cfg: Config) -> Result<()> {
         hello,
         transfers,
         clipboard,
+        windows,
+        shares: HashMap::new(),
+        viewers: HashSet::new(),
         peers: HashMap::new(),
         dialing: HashSet::new(),
         monitors,
@@ -319,6 +363,7 @@ impl Engine {
             Event::Disconnected { name, conn_id } => {
                 if self.peers.get(&name).is_some_and(|p| p.conn_id == conn_id) {
                     self.peers.remove(&name);
+                    self.windows_peer_gone(&name);
                     self.rebuild_geometry();
                     self.apply_focus(None);
                 }
@@ -361,6 +406,8 @@ impl Engine {
             }
             Event::Tick => self.on_tick(),
             Event::Api(req) => self.on_api(req),
+            Event::Viewer(ev) => self.on_viewer(ev),
+            Event::ShareEnded { share } => self.stop_share(share),
         }
     }
 
@@ -467,6 +514,9 @@ impl Engine {
                 }
             }
             Message::Input(ev) => self.on_remote_input(from, ev),
+            m @ (Message::WindowOpen { .. } | Message::WindowFrame { .. } | Message::WindowClose { .. } | Message::WindowInput { .. }) => {
+                self.on_window_message(from, m)
+            }
             Message::Clipboard(data) => {
                 if let Some(c) = &self.clipboard {
                     let _ = c.send(data);
@@ -551,6 +601,12 @@ impl Engine {
                 };
                 for (dx, dy) in probes {
                     if let Step::Cross { machine, at } = self.geom.step(&self.name, p, dx, dy) {
+                        // A window dragged over the edge goes along to that PC.
+                        if let Some(window) = self.windows.dragged() {
+                            if let Err(e) = self.start_share(machine.clone(), window) {
+                                tracing::info!("window not moved: {e}");
+                            }
+                        }
                         self.give_focus(machine, at);
                         return;
                     }
@@ -743,6 +799,14 @@ impl Engine {
 
     fn on_api(&mut self, req: ApiRequest) {
         match req {
+            ApiRequest::ShareWindow { window, peer, reply } => {
+                let _ = reply.send(self.start_share(peer, window));
+            }
+            ApiRequest::StopShare { share, reply } => {
+                let known = self.shares.contains_key(&share);
+                self.stop_share(share);
+                let _ = reply.send(if known { Ok(()) } else { Err("not shared any more".into()) });
+            }
             ApiRequest::Pair { target, reply } => self.start_pair(target, reply),
             ApiRequest::PairAnswer { id, accept, reply } => {
                 let answer = self.pair_incoming.iter_mut().find(|p| p.id == id).and_then(|p| p.answer.take());
@@ -826,6 +890,8 @@ impl Engine {
                 .map(|p| PairOutgoingView { id: p.id, target: p.target.clone(), progress: p.progress.clone() })
                 .collect(),
             windows: cfg!(windows),
+            window_list: if self.windows.supported() { self.windows.list() } else { Vec::new() },
+            shares: self.share_views(),
         }
     }
 
@@ -889,12 +955,48 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct FakeWindows {
+        injected: Mutex<Vec<(u64, mpc_core::protocol::WindowInputEvent)>>,
+        viewers: Mutex<Vec<(String, u64, bool)>>,
+        dragged: Mutex<Option<u64>>,
+    }
+
+    impl WindowBackend for FakeWindows {
+        fn supported(&self) -> bool {
+            true
+        }
+        fn list(&self) -> Vec<WindowInfo> {
+            vec![WindowInfo { id: 42, title: "Блокнот".into(), width: 640, height: 480 }]
+        }
+        fn title(&self, id: u64) -> Option<String> {
+            (id == 42).then(|| "Блокнот".into())
+        }
+        fn dragged(&self) -> Option<u64> {
+            *self.dragged.lock().unwrap()
+        }
+        fn prepare(&self, _id: u64) {}
+        fn capture(&self, _id: u64) -> platform::Capture {
+            platform::Capture::Unavailable
+        }
+        fn inject(&self, id: u64, ev: &mpc_core::protocol::WindowInputEvent) {
+            self.injected.lock().unwrap().push((id, *ev));
+        }
+        fn open_viewer(&self, peer: &str, share: u64, _title: &str, _w: u32, _h: u32) {
+            self.viewers.lock().unwrap().push((peer.into(), share, true));
+        }
+        fn show_frame(&self, _peer: &str, _share: u64, _jpeg: Vec<u8>) {}
+        fn close_viewer(&self, peer: &str, share: u64) {
+            self.viewers.lock().unwrap().push((peer.into(), share, false));
+        }
+    }
+
     fn hello(name: &str, input: bool) -> Hello {
         Hello {
             name: name.into(),
             protocol: PROTOCOL_VERSION,
             platform: Platform::Windows,
-            caps: Capabilities { input, clipboard: true, files: true, drives: false },
+            caps: Capabilities { input, clipboard: true, files: true, drives: false, windows: input },
             monitors: if input { vec![Rect::new(0, 0, 1920, 1080)] } else { vec![] },
             layout: SharedLayout::default(),
             focus: FocusToken::default(),
@@ -902,6 +1004,10 @@ mod tests {
     }
 
     fn engine(backend: FakeBackend) -> Engine {
+        engine_w(backend, Arc::new(FakeWindows::default()))
+    }
+
+    fn engine_w(backend: FakeBackend, windows: Arc<FakeWindows>) -> Engine {
         let (events, _rx) = mpsc::unbounded_channel();
         let name = "alpha".to_string();
         let mut layout = SharedLayout { version: 1, author: name.clone(), ..Default::default() };
@@ -915,13 +1021,16 @@ mod tests {
             cfg: Config { name: name.clone(), ..Default::default() },
             cfg_dir: dir,
             name: name.clone(),
-            caps: Capabilities { input: true, clipboard: true, files: true, drives: false },
+            caps: Capabilities { input: true, clipboard: true, files: true, drives: false, windows: true },
             backend: Box::new(backend.clone()),
             net,
             events,
             hello,
             transfers: Transfers::default(),
             clipboard: None,
+            windows,
+            shares: HashMap::new(),
+            viewers: HashSet::new(),
             peers: HashMap::new(),
             dialing: HashSet::new(),
             monitors: backend.monitors(),
@@ -1102,6 +1211,55 @@ mod tests {
         let view = e.devices_view();
         assert_eq!(view.len(), 1);
         assert_eq!((view[0].name.as_str(), view[0].status), ("zeta", "other"));
+    }
+
+    #[tokio::test]
+    async fn dragging_a_window_over_the_edge_shows_it_on_the_other_pc() {
+        let fw = Arc::new(FakeWindows::default());
+        let mut e = engine_w(FakeBackend::default(), fw.clone());
+        let mut beta = connect(&mut e, "beta", 1, true);
+        drain(&mut beta);
+        *fw.dragged.lock().unwrap() = Some(42);
+        e.handle(Event::Local(LocalEvent::MouseAt(Point::new(1910, 500))));
+        e.handle(Event::Local(LocalEvent::MouseAt(Point::new(1919, 500))));
+        let msgs = drain(&mut beta);
+        let share = match &msgs[0] {
+            Message::WindowOpen { share, title, width, height } => {
+                assert_eq!((title.as_str(), *width, *height), ("Блокнот", 640, 480));
+                *share
+            }
+            other => panic!("expected WindowOpen, got {other:?}"),
+        };
+        assert!(matches!(msgs[1], Message::Focus { .. }), "the cursor goes along");
+        assert_eq!(e.share_views().len(), 1);
+
+        // Input from the viewer reaches the original window.
+        let ev = mpc_core::protocol::WindowInputEvent::MouseButton { button: MouseButton::Left, down: true, x: 10, y: 20 };
+        e.handle(Event::FromPeer { name: "beta".into(), conn_id: 1, msg: Message::WindowInput { share, ev } });
+        assert_eq!(*fw.injected.lock().unwrap(), [(42, ev)]);
+
+        // Closing the viewer there ends the share here.
+        e.handle(Event::FromPeer { name: "beta".into(), conn_id: 1, msg: Message::WindowClose { share } });
+        assert!(e.share_views().is_empty());
+    }
+
+    #[tokio::test]
+    async fn windows_from_other_pcs_open_here_and_close_with_their_pc() {
+        let fw = Arc::new(FakeWindows::default());
+        let mut e = engine_w(FakeBackend::default(), fw.clone());
+        let mut beta = connect(&mut e, "beta", 1, true);
+        drain(&mut beta);
+        let open = Message::WindowOpen { share: 7, title: "Paint".into(), width: 800, height: 600 };
+        e.handle(Event::FromPeer { name: "beta".into(), conn_id: 1, msg: open });
+        assert_eq!(*fw.viewers.lock().unwrap(), [("beta".to_string(), 7, true)]);
+
+        let ev = mpc_core::protocol::WindowInputEvent::Key { scan: 0x1e, extended: false, vk: 0x41, down: true };
+        e.handle(Event::Viewer(ViewerEvent::Input { peer: "beta".into(), share: 7, ev }));
+        assert_eq!(drain(&mut beta), [Message::WindowInput { share: 7, ev }]);
+
+        e.handle(Event::Disconnected { name: "beta".into(), conn_id: 1 });
+        assert_eq!(fw.viewers.lock().unwrap().last(), Some(&("beta".to_string(), 7, false)));
+        assert!(e.viewers.is_empty());
     }
 
     #[test]
