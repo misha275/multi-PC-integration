@@ -561,6 +561,11 @@ impl Engine {
         let remote = owner != self.name;
         if remote != self.captured {
             self.captured = remote;
+            if remote {
+                tracing::info!("курсор и клавиатура теперь управляют ПК {owner}; вернуть их сюда: Scroll Lock");
+            } else {
+                tracing::info!("курсор и клавиатура снова на этом ПК");
+            }
             self.backend.set_capture(remote, self.park_point());
         }
         if !remote {

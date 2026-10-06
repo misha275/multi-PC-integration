@@ -12,6 +12,7 @@ use std::sync::OnceLock;
 use tokio::sync::mpsc::UnboundedSender;
 use windows_sys::Win32::Foundation::{LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO};
+use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::HiDpi::{SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
@@ -23,6 +24,61 @@ pub(super) const OUR_EXTRA_INFO: usize = 0x4D50_4331; // "MPC1"
 static EVENTS: OnceLock<UnboundedSender<LocalEvent>> = OnceLock::new();
 static CAPTURE: AtomicBool = AtomicBool::new(false);
 static PARK: AtomicI64 = AtomicI64::new(0);
+static HIDDEN: AtomicBool = AtomicBool::new(false);
+static INJECT_WARNED: AtomicBool = AtomicBool::new(false);
+
+/// Every standard cursor shape; all are swapped for an empty one while hidden.
+const CURSORS: [SYSTEM_CURSOR_ID; 14] = [
+    OCR_NORMAL,
+    OCR_IBEAM,
+    OCR_WAIT,
+    OCR_CROSS,
+    OCR_UP,
+    OCR_SIZENWSE,
+    OCR_SIZENESW,
+    OCR_SIZEWE,
+    OCR_SIZENS,
+    OCR_SIZEALL,
+    OCR_NO,
+    OCR_HAND,
+    OCR_APPSTARTING,
+    OCR_HELP,
+];
+
+/// Hide or show the mouse cursor on this PC. Windows has no switch for this, so
+/// the system cursors are replaced with an empty one and later reloaded.
+fn hide_cursor(hide: bool) {
+    if HIDDEN.swap(hide, Ordering::Relaxed) == hide {
+        return;
+    }
+    unsafe {
+        if hide {
+            let and = [0xFFu8; 32 * 32 / 8];
+            let xor = [0u8; 32 * 32 / 8];
+            for id in CURSORS {
+                let blank = CreateCursor(GetModuleHandleW(std::ptr::null()), 0, 0, 32, 32, and.as_ptr().cast(), xor.as_ptr().cast());
+                // On success Windows owns the cursor; otherwise free it ourselves.
+                if !blank.is_null() && SetSystemCursor(blank, id) == 0 {
+                    DestroyCursor(blank);
+                }
+            }
+        } else {
+            restore_cursors();
+        }
+    }
+}
+
+fn restore_cursors() {
+    unsafe {
+        SystemParametersInfoW(SPI_SETCURSORS, 0, std::ptr::null_mut(), 0);
+    }
+}
+
+/// Bring the cursor back when the console window is closed or Ctrl+C is pressed.
+unsafe extern "system" fn console_ctrl(_kind: u32) -> windows_sys::core::BOOL {
+    restore_cursors();
+    0 // let Windows go on and end the program
+}
 
 fn pack(p: Point) -> i64 {
     ((p.x as i64) << 32) | (p.y as u32 as i64)
@@ -130,6 +186,16 @@ impl WindowsInput {
             SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         }
         let _ = EVENTS.set(events);
+        // A previous run that crashed may have left the cursor hidden.
+        restore_cursors();
+        unsafe {
+            SetConsoleCtrlHandler(Some(console_ctrl), 1);
+        }
+        let default_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            restore_cursors();
+            default_hook(info)
+        }));
         std::thread::Builder::new()
             .name("input-hooks".into())
             .spawn(|| unsafe {
@@ -151,8 +217,11 @@ impl WindowsInput {
     }
 
     fn send(inputs: &[INPUT]) {
-        unsafe {
-            SendInput(inputs.len() as u32, inputs.as_ptr(), std::mem::size_of::<INPUT>() as i32);
+        let sent = unsafe { SendInput(inputs.len() as u32, inputs.as_ptr(), std::mem::size_of::<INPUT>() as i32) };
+        if sent == 0 && !INJECT_WARNED.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                "Windows не принял нажатия от другого ПК. Обычно так бывает, когда активное окно запущено от имени администратора: запустите MultiPC тоже от имени администратора"
+            );
         }
     }
 
@@ -161,6 +230,12 @@ impl WindowsInput {
             r#type: INPUT_MOUSE,
             Anonymous: INPUT_0 { mi: MOUSEINPUT { dx, dy, mouseData: data as _, dwFlags: flags, time: 0, dwExtraInfo: OUR_EXTRA_INFO } },
         }
+    }
+}
+
+impl Drop for WindowsInput {
+    fn drop(&mut self) {
+        restore_cursors();
     }
 }
 
@@ -188,6 +263,9 @@ impl InputBackend for WindowsInput {
     fn set_capture(&self, capture: bool, park: Point) {
         PARK.store(pack(park), Ordering::Relaxed);
         CAPTURE.store(capture, Ordering::Relaxed);
+        // While another PC has the cursor, this PC's cursor is hidden so it is clear
+        // where the keyboard and mouse go.
+        hide_cursor(capture);
         if capture {
             unsafe {
                 SetCursorPos(park.x, park.y);
