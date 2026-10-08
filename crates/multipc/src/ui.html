@@ -1,0 +1,326 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MultiPC</title>
+<style>
+  :root { --bg:#f6f7f9; --card:#fff; --text:#1d2330; --muted:#6b7280; --line:#d9dde4; --accent:#2563eb; --self:#dbeafe; --peer:#e9eef5; --ok:#15803d; --bad:#b91c1c; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#14171c; --card:#1d2128; --text:#e6e8eb; --muted:#9aa3ae; --line:#333a44; --accent:#60a5fa; --self:#1e3a5f; --peer:#2a313b; --ok:#4ade80; --bad:#f87171; } }
+  * { box-sizing: border-box; }
+  body { margin:0; font:15px/1.45 system-ui, "Segoe UI", sans-serif; background:var(--bg); color:var(--text); }
+  main { max-width:1100px; margin:0 auto; padding:20px 16px 40px; }
+  h1 { font-size:22px; margin:0 0 4px; }
+  h2 { font-size:16px; margin:0 0 10px; }
+  .sub { color:var(--muted); margin-bottom:18px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:16px; margin-bottom:16px; }
+  #canvas { position:relative; height:360px; border:1px dashed var(--line); border-radius:8px; overflow:hidden; touch-action:none; }
+  .machine { position:absolute; cursor:grab; user-select:none; }
+  .machine.dragging { cursor:grabbing; opacity:.85; z-index:2; }
+  .mon { position:absolute; border:2px solid var(--line); border-radius:4px; background:var(--peer); display:flex; align-items:center; justify-content:center; font-size:12px; color:var(--muted); overflow:hidden; }
+  .self .mon { background:var(--self); border-color:var(--accent); }
+  .cursor .mon { box-shadow:0 0 0 3px var(--ok) inset; }
+  .label { position:absolute; left:0; top:-20px; font-weight:600; font-size:13px; white-space:nowrap; }
+  button { font:inherit; padding:6px 14px; border-radius:6px; border:1px solid var(--accent); background:var(--accent); color:#fff; cursor:pointer; }
+  button.secondary { background:transparent; color:var(--accent); }
+  button:disabled { opacity:.5; cursor:default; }
+  .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+  input[type=text], select { font:inherit; padding:6px 8px; border:1px solid var(--line); border-radius:6px; background:var(--bg); color:var(--text); min-width:0; }
+  input[type=text] { flex:1 1 260px; }
+  table { width:100%; border-collapse:collapse; font-size:14px; }
+  td, th { text-align:left; padding:6px 8px; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { color:var(--muted); font-weight:500; }
+  .muted { color:var(--muted); }
+  .ok { color:var(--ok); } .bad { color:var(--bad); }
+  .hint { color:var(--muted); font-size:13px; margin-top:8px; }
+  .wrap { overflow-x:auto; }
+  .request { border:2px solid var(--accent); }
+  .code { font-size:22px; font-weight:700; letter-spacing:2px; font-variant-numeric:tabular-nums; }
+  td .row { flex-wrap:nowrap; }
+</style>
+</head>
+<body>
+<main>
+  <h1>MultiPC</h1>
+  <div class="sub" id="sub">Подключение…</div>
+
+  <div id="requests"></div>
+
+  <div class="card">
+    <h2>Устройства в сети</h2>
+    <div class="wrap"><table id="devices"></table></div>
+    <div id="outgoing"></div>
+    <div class="row" style="margin-top:12px">
+      <input type="text" id="pairAddr" placeholder="IP-адрес другого ПК, например 192.168.1.20">
+      <button id="pairBtn" class="secondary">Отправить запрос по адресу</button>
+    </div>
+    <div class="row" id="fwRow" style="margin-top:12px; display:none">
+      <button id="fwBtn" class="secondary">Разрешить в брандмауэре Windows</button>
+      <span class="hint" id="fwState" style="margin:0">Нужно, если другой ПК не виден или запрос не доходит. Windows попросит права администратора.</span>
+    </div>
+  </div>
+
+  <div class="card" id="windowsCard" style="display:none">
+    <h2>Перенос окон</h2>
+    <div id="sharesBox"></div>
+    <div class="row">
+      <select id="winSel" style="flex:1 1 260px"></select>
+      <select id="winPeer"></select>
+      <button id="winBtn">Перенести</button>
+    </div>
+    <div class="hint">Или просто перетащите окно за край экрана к соседнему ПК. Программа продолжает работать на этом ПК, а на другом появляется её окно: им можно пользоваться мышью и клавиатурой. Чтобы вернуть окно, закройте его на другом ПК или нажмите «Вернуть».</div>
+    <div id="winState" class="hint"></div>
+  </div>
+
+  <div class="card">
+    <h2>Расположение экранов</h2>
+    <div id="canvas"></div>
+    <div class="row" style="margin-top:10px">
+      <button id="save" disabled>Сохранить расположение</button>
+      <button id="reset" class="secondary" disabled>Отменить изменения</button>
+      <span id="saveState" class="muted"></span>
+    </div>
+    <div class="hint">Перетащите компьютеры так, как стоят их мониторы. Курсор переходит на соседний компьютер через общую границу экранов. Зелёная рамка показывает, где сейчас курсор. Scroll Lock возвращает курсор на этот компьютер.</div>
+  </div>
+
+
+  <div class="card">
+    <h2>Отправить файлы</h2>
+    <div class="row">
+      <select id="peer"></select>
+      <input type="text" id="paths" placeholder="C:\Users\me\Documents\отчёт.docx; C:\Фото">
+      <button id="send">Отправить</button>
+    </div>
+    <div class="hint">Пути к файлам или папкам через «;». Ещё можно из командной строки: <code>multipc send --to ИМЯ путь…</code>. Полученные файлы сохраняются в <span id="dl"></span>.</div>
+    <div id="sendState" class="hint"></div>
+  </div>
+
+  <div class="card">
+    <h2>Передачи</h2>
+    <div class="wrap"><table id="transfers"></table></div>
+  </div>
+</main>
+<script>
+const TOKEN = "__TOKEN__";
+const api = (path, opts = {}) => fetch(path, { ...opts, headers: { "X-Token": TOKEN, "Content-Type": "application/json" } });
+let state = null, draft = null, dirty = false, dragging = null;
+const esc = s => String(s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const PLATFORM = { Windows: "Windows", Android: "Android", Linux: "Linux", MacOs: "macOS", Other: "другая" };
+
+function bbox(mons) {
+  const x = Math.min(...mons.map(m => m.x)), y = Math.min(...mons.map(m => m.y));
+  return { x, y, w: Math.max(...mons.map(m => m.x + m.w)) - x, h: Math.max(...mons.map(m => m.y + m.h)) - y };
+}
+function screenMachines() { return state.machines.filter(m => m.caps.input && m.monitors.length); }
+
+function view() {
+  const ms = screenMachines();
+  const boxes = ms.map(m => { const p = draft[m.name] || { x: 0, y: 0 }; const b = bbox(m.monitors); return { x: p.x, y: p.y, w: b.w, h: b.h }; });
+  if (!boxes.length) return { scale: .1, ox: 0, oy: 0 };
+  const minx = Math.min(...boxes.map(b => b.x)), miny = Math.min(...boxes.map(b => b.y));
+  const maxx = Math.max(...boxes.map(b => b.x + b.w)), maxy = Math.max(...boxes.map(b => b.y + b.h));
+  const el = document.getElementById("canvas");
+  const pad = 40, W = el.clientWidth - pad * 2, H = el.clientHeight - pad * 2;
+  const scale = Math.min(W / (maxx - minx + 2000), H / (maxy - miny + 1200), .2);
+  return { scale, ox: pad - minx * scale + (W - (maxx - minx) * scale) / 2, oy: pad + 10 - miny * scale + (H - (maxy - miny) * scale) / 2 };
+}
+let frozenView = null;
+
+function renderCanvas() {
+  const el = document.getElementById("canvas");
+  const ms = screenMachines();
+  if (!ms.length) { el.innerHTML = '<div class="muted" style="padding:16px">Нет компьютеров с общим вводом. Запустите MultiPC на других ПК с тем же ключом сопряжения.</div>'; return; }
+  const v = frozenView || view();
+  el.innerHTML = "";
+  for (const m of ms) {
+    const p = draft[m.name] || { x: 0, y: 0 }, b = bbox(m.monitors);
+    const d = document.createElement("div");
+    d.className = "machine" + (m.is_self ? " self" : "") + (state.cursor_on === m.name ? " cursor" : "");
+    d.style.left = (v.ox + p.x * v.scale) + "px"; d.style.top = (v.oy + p.y * v.scale) + "px";
+    d.style.width = (b.w * v.scale) + "px"; d.style.height = (b.h * v.scale) + "px";
+    d.innerHTML = `<div class="label">${esc(m.name)}${m.is_self ? " (этот)" : ""}</div>` + m.monitors.map(r =>
+      `<div class="mon" style="left:${(r.x - b.x) * v.scale}px;top:${(r.y - b.y) * v.scale}px;width:${r.w * v.scale}px;height:${r.h * v.scale}px">${r.w}×${r.h}</div>`).join("");
+    d.addEventListener("pointerdown", e => startDrag(e, m, d, v));
+    el.appendChild(d);
+  }
+}
+
+function startDrag(e, m, d, v) {
+  e.preventDefault();
+  d.setPointerCapture(e.pointerId);
+  frozenView = v;
+  const start = { x: e.clientX, y: e.clientY }, orig = { ...(draft[m.name] || { x: 0, y: 0 }) };
+  dragging = m.name; d.classList.add("dragging");
+  const move = ev => {
+    let nx = Math.round(orig.x + (ev.clientX - start.x) / v.scale), ny = Math.round(orig.y + (ev.clientY - start.y) / v.scale);
+    [nx, ny] = snap(m, nx, ny, 40 / v.scale);
+    draft[m.name] = { x: nx, y: ny };
+    d.style.left = (v.ox + nx * v.scale) + "px"; d.style.top = (v.oy + ny * v.scale) + "px";
+  };
+  const up = () => {
+    d.removeEventListener("pointermove", move); d.removeEventListener("pointerup", up);
+    dragging = null; frozenView = null; setDirty(true); renderCanvas();
+  };
+  d.addEventListener("pointermove", move); d.addEventListener("pointerup", up);
+}
+
+// Snap edges to other machines' edges so screens touch exactly.
+function snap(m, x, y, tol) {
+  const b = bbox(m.monitors);
+  let best = { dx: tol + 1, dy: tol + 1, x, y };
+  for (const o of screenMachines()) {
+    if (o.name === m.name || !draft[o.name]) continue;
+    const ob = bbox(o.monitors), op = draft[o.name];
+    const L = op.x, R = op.x + ob.w, T = op.y, B = op.y + ob.h;
+    for (const cx of [L - b.w, R, L, R - b.w]) if (Math.abs(cx - x) < best.dx) { best.dx = Math.abs(cx - x); best.x = cx; }
+    for (const cy of [T - b.h, B, T, B - b.h]) if (Math.abs(cy - y) < best.dy) { best.dy = Math.abs(cy - y); best.y = cy; }
+  }
+  return [best.dx <= tol ? best.x : x, best.dy <= tol ? best.y : y];
+}
+
+function setDirty(v) {
+  dirty = v;
+  document.getElementById("save").disabled = !v;
+  document.getElementById("reset").disabled = !v;
+  document.getElementById("saveState").textContent = v ? "Есть несохранённые изменения" : "";
+}
+
+function renderTables() {
+  document.getElementById("sub").textContent = `Этот компьютер: ${state.name}. Курсор сейчас на: ${state.cursor_on}.`;
+  document.getElementById("dl").textContent = state.download_dir;
+  renderDevices();
+  renderWindows();
+  const sel = document.getElementById("peer"), cur = sel.value;
+  const peers = state.machines.filter(m => !m.is_self && m.caps.files);
+  sel.innerHTML = peers.map(m => `<option>${esc(m.name)}</option>`).join("") || "<option value=''>нет получателей</option>";
+  if (peers.some(m => m.name === cur)) sel.value = cur;
+  const fmt = n => n > 1 << 30 ? (n / (1 << 30)).toFixed(1) + " ГБ" : n > 1 << 20 ? (n / (1 << 20)).toFixed(1) + " МБ" : n > 1024 ? (n / 1024).toFixed(0) + " КБ" : n + " Б";
+  const st = t => t.state === "done" ? '<span class="ok">готово</span>' : t.state === "active" ? `${t.size ? Math.floor(t.done * 100 / t.size) : 100}%` : `<span class="bad">${esc(t.state.replace(/^failed: /, "ошибка: "))}</span>`;
+  const ts = state.transfers.slice().reverse();
+  document.getElementById("transfers").innerHTML = ts.length ? "<tr><th></th><th>Файл</th><th>Компьютер</th><th>Размер</th><th>Состояние</th></tr>" +
+    ts.map(t => `<tr><td>${t.outgoing ? "↑" : "↓"}</td><td>${esc(t.saved_to || t.name)}</td><td>${esc(t.peer)}</td><td>${fmt(t.size)}</td><td>${st(t)}</td></tr>`).join("") :
+    '<tr><td class="muted">Передач пока не было.</td></tr>';
+}
+
+function renderDevices() {
+  const STATUS = { connected: '<span class="ok">подключён</span>', group: "подключается…", other: '<span class="muted">не подключён</span>' };
+  const out = {}; for (const p of state.pair_outgoing) out[p.target] = p;
+  const devs = state.devices;
+  document.getElementById("devices").innerHTML = devs.length
+    ? "<tr><th>Имя</th><th>Адрес</th><th>Система</th><th>Состояние</th><th></th></tr>" + devs.map(d => {
+        const busy = out[d.name] && ["connecting", "waiting"].includes(out[d.name].progress.state);
+        const action = d.status === "other" ? `<button data-pair="${esc(d.name)}" ${busy ? "disabled" : ""}>Отправить запрос</button>` : "";
+        return `<tr><td>${esc(d.name)}</td><td>${esc(d.address)}</td><td>${PLATFORM[d.platform] || d.platform}</td><td>${STATUS[d.status]}</td><td>${action}</td></tr>`;
+      }).join("")
+    : '<tr><td class="muted">Других ПК с MultiPC пока не видно. Запустите MultiPC на другом ПК в этой же сети. Если он запущен, но не появляется здесь, нажмите «Разрешить в брандмауэре Windows» на обоих ПК или отправьте запрос по IP-адресу.</td></tr>';
+  document.querySelectorAll("[data-pair]").forEach(b => b.onclick = () => pair(b.dataset.pair));
+
+  const PROG = {
+    connecting: () => "подключение…",
+    waiting: p => `ждём подтверждения на том ПК. Код: <span class="code">${esc(p.code)}</span> (он должен совпасть с кодом на том ПК)`,
+    accepted: p => `<span class="ok">подключено к группе ${esc(p.name)}</span>`,
+    declined: () => '<span class="bad">запрос отклонён</span>',
+    failed: p => `<span class="bad">не удалось: ${esc(p.error)}</span>`,
+  };
+  document.getElementById("outgoing").innerHTML = state.pair_outgoing.map(p =>
+    `<div class="hint">Запрос на ${esc(p.target)}: ${PROG[p.progress.state](p.progress)}</div>`).join("");
+
+  document.getElementById("requests").innerHTML = state.pair_requests.map(r => `
+    <div class="card request">
+      <h2>${esc(r.name)} (${esc(r.address)}, ${PLATFORM[r.platform] || r.platform}) хочет подключиться</h2>
+      <div>Код: <span class="code">${esc(r.code)}</span></div>
+      <div class="hint">Примите, только если на том ПК показан такой же код. После этого он сможет управлять этим ПК, обмениваться файлами и буфером обмена.</div>
+      <div class="row" style="margin-top:10px"><button data-accept="${r.id}">Принять</button><button class="secondary" data-decline="${r.id}">Отклонить</button></div>
+    </div>`).join("");
+  document.querySelectorAll("[data-accept]").forEach(b => b.onclick = () => answer(b.dataset.accept, true));
+  document.querySelectorAll("[data-decline]").forEach(b => b.onclick = () => answer(b.dataset.decline, false));
+  document.getElementById("fwRow").style.display = state.windows ? "flex" : "none";
+}
+
+function renderWindows() {
+  const peers = state.machines.filter(m => !m.is_self && m.caps.windows);
+  const card = document.getElementById("windowsCard");
+  card.style.display = state.window_list.length || state.shares.length ? "block" : "none";
+  document.getElementById("sharesBox").innerHTML = state.shares.map(s =>
+    `<div class="row" style="margin-bottom:8px"><span>«${esc(s.title)}» показано на ${esc(s.peer)}</span><button class="secondary" data-unshare="${s.share}">Вернуть</button></div>`).join("");
+  document.querySelectorAll("[data-unshare]").forEach(b => b.onclick = async () => {
+    await api("/api/window/stop", { method: "POST", body: JSON.stringify({ share: Number(b.dataset.unshare) }) });
+    refresh();
+  });
+  const sel = document.getElementById("winSel"), cur = sel.value;
+  if (document.activeElement !== sel) {
+    sel.innerHTML = state.window_list.map(w => `<option value="${w.id}">${esc(w.title)} (${w.width}×${w.height})</option>`).join("") || "<option value=''>нет окон</option>";
+    if (state.window_list.some(w => String(w.id) === cur)) sel.value = cur;
+  }
+  const ps = document.getElementById("winPeer"), curP = ps.value;
+  if (document.activeElement !== ps) {
+    ps.innerHTML = peers.map(m => `<option>${esc(m.name)}</option>`).join("") || "<option value=''>нет подключённых ПК</option>";
+    if (peers.some(m => m.name === curP)) ps.value = curP;
+  }
+  document.getElementById("winBtn").disabled = !peers.length || !state.window_list.length;
+}
+
+async function pair(target) {
+  const r = await api("/api/pair", { method: "POST", body: JSON.stringify({ target }) });
+  if (!r.ok) alert("Не удалось отправить запрос: " + await r.text());
+  refresh();
+}
+
+async function answer(id, accept) {
+  const r = await api("/api/pair/answer", { method: "POST", body: JSON.stringify({ id: Number(id), accept }) });
+  if (!r.ok) alert("Запрос уже не действует: " + await r.text());
+  refresh();
+}
+
+async function refresh() {
+  try {
+    const r = await api("/api/state");
+    if (!r.ok) throw new Error(r.status);
+    state = await r.json();
+    if (!dirty && !dragging) {
+      draft = {};
+      for (const m of state.machines) if (m.placement) draft[m.name] = m.placement;
+      renderCanvas();
+    }
+    renderTables();
+  } catch (e) {
+    document.getElementById("sub").innerHTML = '<span class="bad">Нет связи с MultiPC. Программа запущена?</span>';
+  }
+}
+
+document.getElementById("save").onclick = async () => {
+  const r = await api("/api/layout", { method: "POST", body: JSON.stringify(draft) });
+  document.getElementById("saveState").textContent = r.ok ? "Сохранено" : "Не удалось сохранить";
+  if (r.ok) { dirty = false; document.getElementById("save").disabled = true; document.getElementById("reset").disabled = true; refresh(); }
+};
+document.getElementById("reset").onclick = () => { setDirty(false); refresh(); };
+document.getElementById("send").onclick = async () => {
+  const peer = document.getElementById("peer").value;
+  const paths = document.getElementById("paths").value.split(";").map(s => s.trim().replace(/^"|"$/g, "")).filter(Boolean);
+  const out = document.getElementById("sendState");
+  if (!peer || !paths.length) { out.textContent = "Выберите компьютер и укажите путь."; return; }
+  const r = await api("/api/send", { method: "POST", body: JSON.stringify({ peer, paths }) });
+  out.textContent = r.ok ? "Отправка началась." : "Ошибка: " + await r.text();
+  refresh();
+};
+document.getElementById("winBtn").onclick = async () => {
+  const window = Number(document.getElementById("winSel").value), peer = document.getElementById("winPeer").value;
+  if (!window || !peer) return;
+  const r = await api("/api/window/share", { method: "POST", body: JSON.stringify({ window, peer }) });
+  document.getElementById("winState").textContent = r.ok ? `Окно показано на ${peer}.` : "Не получилось: " + await r.text();
+  refresh();
+};
+document.getElementById("pairBtn").onclick = () => {
+  const a = document.getElementById("pairAddr").value.trim();
+  if (a) pair(a);
+};
+document.getElementById("fwBtn").onclick = async () => {
+  const r = await api("/api/firewall", { method: "POST" });
+  document.getElementById("fwState").textContent = r.ok ? "Подтвердите запрос Windows. После этого перезапускать ничего не нужно." : "Не получилось: " + await r.text();
+};
+window.addEventListener("resize", () => { if (!dragging) renderCanvas(); });
+refresh();
+setInterval(refresh, 1500);
+</script>
+</body>
+</html>
